@@ -1,0 +1,431 @@
+---
+title: "MovieLens - machine learning project"
+author: "Michael Ng"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.align="center", echo = TRUE, out.width="60%")
+```
+
+# Introduction
+
+This is a capstone project of the HarvardX Data Science Professional Certificate.
+
+The goal of this project is to build a movie recommendation system using the MovieLens dataset.  A machine learning algorithm will be trained to use the inputs in the training set to predict movie ratings in the validation set.  The target is to reduce the Root Mean Squared Error (RMSE) to below 0.86490. 
+
+This project uses around 10 million entries from the Movielens dataset.  The 10M entries are separated into two sets: `edx` (contain 9M entries) and `validation` (contain 1M entries).  The `validation` dataset will only be used for final validation.  The `edx` dataset will be further separated into `train` and `test` sets for training and testing purpose. 
+
+The following key steps will be performed to achieve the purpose of the project: data import, data exploration and preparation, algorithm training and testing, and final validation.  By the method of matrix factorisation, RMSE of 0.83319 can be achieved during the final validation.  
+
+## Data Import
+
+`edx` and `validation` datasets are imported with the following code. 
+
+```{r library, include=FALSE}
+if(!require(dplyr)) install.packages("dplyr", repos = "http://cran.us.r-project.org")
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+if(!require(recosystem)) install.packages("recosystem", repos = "http://cran.us.r-project.org")
+```
+
+```{r data, include=TRUE}
+library(dplyr)
+library(tidyverse)
+library(caret)
+library(data.table)
+library(recosystem)
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId),
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding") # if using R 3.5 or earlier, use `set.seed(1)`
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+
+# Methods / Analysis
+
+## Exploratory Data Analysis
+
+`edx` is a data frame with 9,000,055 rows and 6 columns, while `validation` is a data frame with 999,999 rows and 6 columns.  The 6 columns represent 6 variables.  Variable `rating` is the outcome that we would like our machine learning algorithm to predict.  Other variables, e.g. `movieId`, `userId` and `timestamp`, may be used as inputs for the algorithm. 
+
+```{r Exploratory-Data-Analysis}
+dim(edx)
+dim(validation)
+head(edx)
+str(edx)
+```
+
+### rating
+
+`rating` is the variable that we would like to predict.  There are 10 distinct ratings in the datasets, ranging from 0.5 to 5, with an interval of 0.5.  From the below bar plot, it is observed that the most common rating is 4, followed by 3.  Users tend to give integer ratings.  
+
+```{r rating}
+
+n_distinct(edx$rating)
+
+edx %>%
+  ggplot(aes(rating, y = ..prop..)) +
+  geom_bar(color = "black") +
+  labs(x = "Ratings", y = "Relative Frequency") +
+  scale_x_continuous(breaks = c(0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5)) 
+```
+
+### movieId
+
+There are 10,677 distinct `movieId` in the `edx` dataset, representing 10,677 unique movies. As seen from the following tables and plots, the most rated movie was rated 31,362 times, while the least rated movie was only rated 1 time.  We know from experience and from plots that some movies are rated higher than others, and some are rated more often.  In the Results section, we will demonstrate how to approximate this "movie bias" and include these factors in our algorithm. 
+
+```{r movieId}
+
+n_distinct(edx$movieId)
+
+edx %>% group_by(movieId) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count)) %>%
+  head()
+
+edx %>% group_by(movieId) %>%
+  summarise(count = n()) %>%
+  arrange(count) %>%
+  head()
+
+edx %>% group_by(movieId) %>%
+  summarize(count = n()) %>%
+  ggplot(aes(count)) +
+  geom_histogram(color = "black", bins = 40) +
+  labs(x = "No. of ratings per movie", y = "No. of movies") +
+  scale_x_log10() 
+
+edx %>% group_by(movieId) %>%
+  summarize(mean_rating = mean(rating)) %>%
+  ggplot(aes(mean_rating)) +
+  geom_histogram(color = "black", bins = 10) 
+
+```
+
+### userId
+
+There are 69,878 distinct `userId` in the `edx` dataset, representing 69,878 unique users.  As seen from the following tables and plot, the most active user submitted 6,616 ratings, while the least active user submitted 10 ratings.  Again, we know from experience and from the plots that some users generally give higher ratings than others, and some give ratings more often.  We will demonstrate how to leverage on this "user bias" in the Results session. 
+
+```{r userId}
+
+n_distinct(edx$userId)
+
+edx %>% group_by(userId) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count)) %>%
+  head()
+
+edx %>% group_by(userId) %>%
+  summarise(count = n()) %>%
+  arrange(count) %>%
+  head()
+
+edx %>% group_by(userId) %>%
+  summarize(count = n()) %>%
+  ggplot(aes(count)) +
+  geom_histogram(color = "black", bins = 40) +
+  labs(x = "No. of ratings per user", y = "No. of users") +
+  scale_x_log10() 
+
+edx %>% group_by(userId) %>%
+  summarise(mean_rating = mean(rating)) %>%
+  ggplot(aes(mean_rating)) +
+  geom_histogram(color = "black", bins = 10) 
+
+```
+
+### timestamp
+
+In the dataset, `timestamp` represents the time when the rating was given.  In order to examine whether `timestamp` can be used as an input to our algorithm, we first have to convert it from integer to date format with the following code (for both `edx` and `validation` datasets).  I would then further group the dates by year to see if there is a relationship between the years and the ratings.  The bar plot shows some difference between the mean rating of each year, but the difference is not as significant as that of "movie bias" and "user bias".  Nonetheless, we will investigate whether "year bias" can help reduce the RMSE in the Results section. 
+
+```{r timestamp}
+edx <- edx %>% 
+  mutate(rating_year = year(as.Date(as.POSIXct(timestamp, origin="1970-01-01"))))
+validation <- validation %>% 
+  mutate(rating_year = year(as.Date(as.POSIXct(timestamp, origin="1970-01-01"))))
+head(edx)
+head(validation)
+
+edx %>% ggplot(aes(rating_year, ..count..)) +
+  geom_bar(color = "black") +
+  labs(x = "rating_year", y = "No. of ratings") 
+
+edx %>% group_by(rating_year) %>%
+  summarize(mean_rating = mean(rating)) %>%
+  ggplot(aes(mean_rating)) +
+  geom_histogram(color = "black", bins = 10)
+```
+
+## Data Splitting
+
+As the `validation` dataset will only be used for final validation, we will split `edx` into `train` (90%) and `test` (10%) datasets for training and testing purpose, with the following code.
+
+```{r split-edx}
+set.seed(1)
+train_index <- createDataPartition(edx$rating, times = 1, p = 0.9, list = FALSE) 
+train <- edx[train_index, ]
+test_temp <- edx[-train_index, ]
+
+test <- test_temp %>%
+  semi_join(train, by = "movieId") %>%
+  semi_join(train, by = "userId")
+
+removed <- anti_join(test_temp, test)
+train <- rbind(train, removed)
+rm(train_index, test_temp, removed)
+```
+
+## Models
+
+### (a) Linear Model
+
+Given the large size of the datasets, there are limitations to the kind of models we can run on a commodity laptop, given the limited computing power.  For example, to develop a linear model to predict rating, we would not use the `lm()` function, since it will be very slow and possibly crash the R Studio.  Instead, we would develop a linear model based on the following formula: 
+
+$$ Y_{movie, user, year} = \mu + b_{movie} + b_{user} + b_{year} + \epsilon_{movie, user, year} $$
+In the Results section, we will include the biases (movie, user and year) in our model one by one, and examine their effectiveness in reducing the RMSE.  From the earlier plots, we are also aware that some movies are less often rated than others, and some users are less active than others.  As these ratings from small sample sizes generally have large error, we would also use regularization to reduce their impact on our predictions. 
+
+### (b) Matrix Factorisation
+
+The above linear model takes into account movie-to-movie differences ($b_{movie}$) and user-to-user differences ($b_{user}$), but does not take into account bias arising from an underlying factor - groups of similar movies/ by similar users may have similar ratings.  We will be able to include this factor in the matrix factorization model.  Theoretically, we may use the following code to factorize the `train` dataset, but given the large size, we would use the `recosystem` package to help with the factorization and prediction more efficiently. 
+
+```{r mf-code, eval=FALSE}
+train_mf <- train %>% 
+  select(userId, movieId, rating) %>% 
+  spread(movieId, rating) %>% 
+  as.matrix()
+```
+
+## Model Evaluation - RMSE
+
+For the sake of convenience, we first develop the `RMSE` function which allows us to evaluate the models with ease.  
+
+```{r RMSE-function}
+RMSE <- function(predicted, actual){
+  sqrt(mean((predicted - actual)^2))
+}
+```
+
+# Results
+
+## Model 1 - Simple mean 
+
+The first variable $\mu$ of the linear model represents the mean rating of the `train` set.  This is the base model where we simply use the mean rating for prediction, without considering any other factors, e.g. movie bias and user bias.  
+
+```{r Model-1}
+mu <- mean(train$rating)  
+mu_rmse <- RMSE(mu, test$rating)
+results <- tibble(Model = "Project Goal", RMSE = 0.86490)
+results <- bind_rows(results, tibble(Model = "1. Simple mean", RMSE = mu_rmse))
+results %>% knitr::kable()
+```
+
+## Model 2 - Including movie bias 
+
+During the data exploration, we have discovered that some movies are generally rated higher than others.  If we include the movie bias, the model would likely be more accurate.  We can see that RMSE is improved from the following code, but not yet reaching the project goal.  
+
+```{r Model-2}
+b_movie <- train %>%
+  group_by(movieId) %>%
+  summarize(b_m = mean(rating - mu))
+
+pred2 <- mu + test %>% 
+  left_join(b_movie, by = "movieId") %>% 
+  pull(b_m) 
+pred2_rmse <- RMSE(pred2, test$rating)
+results <- bind_rows(results, tibble(Model = "2. Including movie bias", RMSE = pred2_rmse))
+results %>% knitr::kable()
+```
+
+## Model 3 - Including movie and user bias
+
+From data exploration, apart from movie bias, we are also quite certain that some users generally give higher ratings than others.  Now we are adding user bias on top of movie bias.  From the following result, we see that RMSE has been further improved.  
+
+```{r Model-3}
+b_user <- train %>%
+  left_join(b_movie, by = "movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - b_m - mu))
+
+pred3 <- mu + test %>% 
+  left_join(b_movie, by = "movieId") %>%
+  left_join(b_user, by = "userId") %>%
+  mutate(b_m_u = b_m + b_u) %>% 
+  pull(b_m_u)
+pred3_rmse <- RMSE(pred3, test$rating)
+results <- bind_rows(results, tibble(Model = "3. Including movie and user bias", RMSE = pred3_rmse))
+results %>% knitr::kable()
+
+```
+
+## Model 4 - Including movie, user and year bias
+
+During the data exploration, we noted that the ratings were given across a range of years, but we saw insignificant differences in mean ratings across years (compared to the rating differences of different movies and users).  Nonetheless, we will try to add year bias in our model to see if RMSE improves.  From the following results, we can see that adding year bias brought almost no effect in improving RMSE, so we will just drop the year bias from now on.  
+
+```{r Model-4}
+b_year <- train %>% 
+  left_join(b_movie, by = "movieId") %>%
+  left_join(b_user, by = "userId") %>%
+  group_by(rating_year) %>%
+  summarize(b_y = mean(rating - b_m - b_u - mu))
+
+pred4 <- mu + test %>%
+  left_join(b_movie, by = "movieId") %>%
+  left_join(b_user, by = "userId") %>%
+  left_join(b_year, by = "rating_year") %>%
+  mutate(b_m_u_y = b_m + b_u + b_y) %>%
+  pull(b_m_u_y)
+pred4_rmse <- RMSE(pred4, test$rating)
+results <- bind_rows(results, tibble(Model = "4. Including movie, user and year bias", RMSE = pred4_rmse))
+results %>% knitr::kable()
+
+```
+
+## Model 5 - Including movie and user bias (regularised)
+
+Regularization can be performed by adding a "penalty" $\lambda$ so that the movie bias and user bias are less affected by extreme ratings from small sample size.  In the following code, we use cross-validation to pick a $\lambda$ which is optimal in improving the RMSE, and it is then applied to run the model.  Applying model 5 on the `test` set, we successfully reached our project goal with RMSE of 0.86448.
+
+```{r Model-5}
+lambdas <- seq(0, 10, 0.25)
+
+pred5_rmses <- sapply(lambdas, function(x){
+  
+  b_movie <- train %>% 
+    group_by(movieId) %>%
+    summarize(b_m = sum(rating - mu)/(n()+x))
+  
+  b_user <- train %>% 
+    left_join(b_movie, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_m - mu)/(n()+x))
+  
+  pred5 <- mu + test %>% 
+    left_join(b_movie, by = "movieId") %>%
+    left_join(b_user, by = "userId") %>%
+    mutate(b_m_u = b_m + b_u) %>%
+    pull(b_m_u)
+  
+  return(RMSE(pred5, test$rating))
+})
+
+qplot(lambdas, pred5_rmses)
+lambda <- lambdas[which.min(pred5_rmses)]
+lambda
+
+results <- bind_rows(results, tibble(Model = "5. Including movie and user bias (regularised)", RMSE = min(pred5_rmses)))
+results %>% knitr::kable()
+
+```
+
+## Alternative: Matrix factorisation
+
+Matrix factorisation is an alternative to the above linear model.  Here we use the `recosystem` package to run the model in a more efficient manner.  Simply by using the default parameters, we can already obtain RMSE of 0.83253 which significantly passed our project goal.  
+
+```{r Alternative}
+train_reco <- with(train, data_memory(user_index = userId, item_index = movieId, rating = rating))
+test_reco <- with(test, data_memory(user_index = userId, item_index = movieId, rating = rating))
+r <- Reco()
+r$train(train_reco)
+results_reco <- r$predict(test_reco, out_memory())
+
+mf_rmse <- RMSE(results_reco, test$rating)
+results <- bind_rows(results, tibble(Model = "Alternative: Matrix factorization", RMSE = mf_rmse))
+results %>% knitr::kable()
+
+```
+
+## Final Validation
+
+Now we would use the `validation` set to check the final RMSE as below.  The RMSE of model 5 went slightly higher than when using the `test` set, and did not reach the project goal.  However, the RMSE of matrix factorization is still significantly lower than the project goal.  
+
+```{r final-validation, echo=FALSE}
+v_mu_rmse <- RMSE(mu, validation$rating)
+v_results <- tibble(Model = "Project Goal", validation_RMSE = 0.86490)
+v_results <- bind_rows(v_results, tibble(Model = "1. Simple mean", validation_RMSE = v_mu_rmse))
+
+v_pred2 <- mu + validation %>% 
+  left_join(b_movie, by = "movieId") %>% 
+  pull(b_m) 
+v_pred2_rmse <- RMSE(v_pred2, validation$rating)
+v_results <- bind_rows(v_results, tibble(Model = "2. Including movie bias", validation_RMSE = v_pred2_rmse))
+
+v_pred3 <- mu + validation %>% 
+  left_join(b_movie, by = "movieId") %>%
+  left_join(b_user, by = "userId") %>%
+  mutate(b_m_u = b_m + b_u) %>% 
+  pull(b_m_u)
+v_pred3_rmse <- RMSE(v_pred3, validation$rating)
+v_results <- bind_rows(v_results, tibble(Model = "3. Including movie and user bias", validation_RMSE = v_pred3_rmse))
+
+v_pred4 <- mu + validation %>%
+  left_join(b_movie, by = "movieId") %>%
+  left_join(b_user, by = "userId") %>%
+  left_join(b_year, by = "rating_year") %>%
+  mutate(b_m_u_y = b_m + b_u + b_y) %>%
+  pull(b_m_u_y)
+v_pred4_rmse <- RMSE(v_pred4, validation$rating)
+v_results <- bind_rows(v_results, tibble(Model = "4. Including movie, user and year bias", validation_RMSE = v_pred4_rmse))
+
+b_reg_movie <- train %>% 
+  group_by(movieId) %>%
+  summarize(b_rm = sum(rating - mu)/(n()+lambda))
+
+b_reg_user <- train %>% 
+  left_join(b_reg_movie, by="movieId") %>%
+  group_by(userId) %>%
+  summarize(b_ru = sum(rating - b_rm - mu)/(n()+lambda))
+
+v_pred5 <- mu + validation %>% 
+  left_join(b_reg_movie, by = "movieId") %>%
+  left_join(b_reg_user, by = "userId") %>%
+  mutate(b_rmu = b_rm + b_ru) %>%
+  pull(b_rmu)
+v_pred5_rmse <- RMSE(v_pred5, validation$rating)
+v_results <- bind_rows(v_results, tibble(Model = "5. Including movie and user bias (regularised)", validation_RMSE = v_pred5_rmse))
+
+validation_reco <- with(validation, data_memory(user_index = userId, item_index = movieId, rating = rating))
+v_results_reco <- r$predict(validation_reco, out_memory())
+
+v_mf_rmse <- RMSE(v_results_reco, validation$rating)
+v_results <- bind_rows(v_results, tibble(Model = "Alternative: Matrix factorization", validation_RMSE = v_mf_rmse))
+
+v_results %>% knitr::kable()
+
+```
+
+# Conclusion 
+
+In this MovieLens project, we first explored, prepared and analyzed the datasets.  With insights from exploratory data analysis, we built a linear model and a matrix factorization model.  When applied to the `test` and `validation` sets, we observed that the matrix factorization model consistently reached the project goal and performed better than the linear model. 
+
+A major limitation of this project is computing power.  With a commodity laptop, we cannot build models using functions like `lm()`, `knn()` and `randomForest()` with a 10M dataset.  Computing power has limited the models that we can choose from. 
+
+For future work, there are rooms for improvement for both linear and matrix factorization models.  One way is to try and include more inputs in both models, e.g. genres.  For matrix factorization, parameters in the `recosystem` package may also be finetuned to achieve better results.  In practice, users of the models should also be reminded that the `train` set should be updated from time to time to include new ratings of new movies and users, to keep the models up-to-date.  
